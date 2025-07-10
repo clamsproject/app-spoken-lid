@@ -5,7 +5,7 @@ import librosa
 import torch
 import whisper
 
-from lid_util2 import detect_language_by_chunk
+from lid_util import detect_language_by_chunk
 
 
 def load_audio_16k(path):
@@ -23,14 +23,14 @@ def chunk_audio(wave, sr, chunk_sec=30):
 
 def audio_to_mel(chunk, model):
     # adapt from whisper's audio.py
-    # waveform --> Whisper supported Mel tensor [1, 80, 3000]
+    # waveform --> Whisper supported Mel tensor [1, 80, 3000] or [1, 128, 3000]
 
     # pat or trim to 30s
 
     wav = torch.tensor(chunk, dtype=torch.float32).to(model.device)
     wav = whisper.pad_or_trim(wav)          # 30-second window
-    mel = whisper.log_mel_spectrogram(wav)  # [80, 3000]
-    return mel.unsqueeze(0)                 # add batch dim to [1, 80, 3000] as model.detect_language expects
+    mel = whisper.log_mel_spectrogram(wav, n_mels=model.dims.n_mels) # 80 or 128
+    return mel.unsqueeze(0)                 # add batch dim to [1, 80, 3000] or [1, 128, 3000] as model.detect_language expects
 
 
 # cli
@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--batch", type=int, default=1,
                         help="number of windows in one forward pass")
     parser.add_argument("--top", type=int, default=3, help="top languague scores")
-    perser.add_argument("--out", default="preds.csv")
+    parser.add_argument("--out", default="preds.csv")
     args = parser.parse_args()
 
     model = whisper.load_model(args.model)
@@ -84,10 +84,11 @@ def main():
         #     f"{lang}  |  top-3 {top3}"
         # )
         rows.append({
-            "file: " Path(args.audio).name,
-            "start: " start_s
-            "end: " end_s
-            "topN: " topN
+            "file": Path(args.audio).name,
+            "start": start_s,
+            "end": end_s,
+            "pred": topN[0][0],
+            "topN": topN
             })
 
     with open(args.out, "w", newline="") as f:
