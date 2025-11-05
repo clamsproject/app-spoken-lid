@@ -1,18 +1,19 @@
-# AAPB-LID
+# CLAMS Spoken Language Identification App
 
-Proof-of-concept pipeline for **language identification (LID)** on American Archive of Public Broadcasting (AAPB) audio.  
-Built around OpenAI Whisper for rapid prototyping. 
+## Description
 
-## Quick start: 
-configurable arguments in <>:
+This app performs spoken language identification (LID) on audio files using a pre-trained model. Current version uses OpenAI's Whisper model for LID.
 
-`python app_lid.py <fleurs_mixed_01.wav> 
-    --model <tiny> 
-    --window <30> 
-    --batch <1> 
-    --top <3> 
-    --out <results/preds.csv>`
+## User instruction
 
-To do: revise batch inference
+General user instructions for CLAMS apps are available at [CLAMS Apps documentation](https://apps.clams.ai/clamsapp).
 
 
+### System requirements
+
+If CUDA device is available, the app will utilize it for faster processing. Otherwise, it will run on CPU.
+
+
+### Configurable runtime parameter
+
+For the full list of parameters, please refer to the app metadata from the [CLAMS App Directory](https://apps.clams.ai) or the [`metadata.py`](metadata.py) file in this repository.
