@@ -1,53 +1,116 @@
-"""
-The purpose of this file is to define the metadata of the app with minimal imports.
-
-DO NOT CHANGE the name of the file
-"""
 import re
 from clams.app import ClamsApp
 from clams.appmetadata import AppMetadata
 from mmif import DocumentTypes, AnnotationTypes
 
-whisper_version = 'v' + [line.strip().rsplit('==')[-1]
-                   for line in open('requirements.txt').readlines() if re.match(r'^openai-whisper==', line)][0]
-whisper_lang_list = f"https://raw.githubusercontent.com/openai/whisper/refs/tags/{whisper_version}/whisper/tokenizer.py"
-
-
-# DO NOT CHANGE the function name
-def appmetadata():
-    metadata = AppMetadata(
-        name="Spoken Language Identification",
-        identifier="spoken-lid",
-        url="https://github.com/clamsproject/app-spoken-lid",
-        description="Chunk-level language ID over audio based on OpenAI Whisper",
+def appmetadata() -> AppMetadata:
+    md = AppMetadata(
+        name="Spoken LID (VoxLingua107-ECAPA)",
+        description=(
+            "Chunk-level language identification using SpeechBrain's "
+            "VoxLingua107 ECAPA model. Produces TimeFrame annotations "
+            "with top-N language scores."
+        ),
         app_license="Apache 2.0",
-        analyzer_version=whisper_version,
-        analyzer_license="MIT",
+        url="https://apps.clams.ai/",
+        identifier="https://apps.clams.ai/voxlingua-lid"
     )
+    # I/O
+    md.add_input(DocumentTypes.AudioDocument)
+    md.add_output(AnnotationTypes.TimeFrame)
 
-    # input
-    metadata.add_input_oneof(DocumentTypes.AudioDocument, DocumentTypes.VideoDocument)
+    # Parameters
+    md.add_parameter(
+        name="chunk",
+        type="number",
+        default=30.0,
+        description="Chunk length in seconds for windowed LID."
+    )
+    md.add_parameter(
+        name="top",
+        type="integer",
+        default=3,
+        description="Top-N language scores to keep per chunk."
+    )
+    md.add_parameter(
+        name="device",
+        type="string",
+        default="auto",
+        choices=["cpu", "cuda", "auto"],
+        description="Inference device selection."
+    )
+    return md
 
-    # output
-    metadata.add_output(AnnotationTypes.TimeFrame, timeUnit="seconds", labalSet=whisper_lang_list)
+class App(ClamsApp):
+    def __init__(self):
+        super().__init__()
+        self.__metadata = appmetadata()
 
-    # parameters
-    metadata.add_parameter(name="model", type="string", default="tiny", description="Whisper model size",
-                           choices=["tiny", "base", "small", "medium", "large", "turbo"])
-    metadata.add_parameter(name="chunk", type="number", default=30, description="chunk/window length in seconds")
-    metadata.add_parameter(name="top", type="integer", default=3, description="top-k language scores")
-    metadata.add_parameter(name="batchSize", type="integer", default=1,
-                           description="number of windows processed in a batch")
+    def _appmetadata(self):
+        return self.__metadata
 
-    return metadata
+    def _annotate(self, mmif, **params):
+        from mmif import Mmif
+        from mmif.utils import generate_uuid
+        from lapps.discriminators import Uri
+        import json
 
-    # DO NOT CHANGE the main block
+        # Lazy import to keep init lightweight
+        from app import VoxLinguaLID, load_audio_16k, chunk_audio
 
+        # Resolve params
+        chunk = float(params.get("chunk", 30.0))
+        top = int(params.get("top", 3))
+        device = params.get("device", "auto")
 
-if __name__ == '__main__':
-    import sys
+        # Prepare output MMIF structures
+        mmif_obj = Mmif(mmif) if isinstance(mmif, (str, bytes, dict)) else mmif
+        new_view = mmif_obj.new_view()
+        self.sign_view(new_view, params)
 
-    metadata = appmetadata()
-    for param in ClamsApp.universal_parameters:
-        metadata.add_parameter(**param)
-    sys.stdout.write(metadata.jsonify(pretty=True))
+        # Declare what this view will contain
+        new_view.new_contain(
+            AnnotationTypes.TimeFrame, 
+            document=None,  # will set per-annotation
+            timeUnit="milliseconds"
+        )
+
+        # Build model once
+        model = VoxLinguaLID(device=device)
+
+        # Iterate audio documents
+        for doc in mmif_obj.documents:
+            if doc.at_type != DocumentTypes.AudioDocument:
+                continue
+
+            # Try to resolve location
+            loc = doc.location
+            if loc and loc.startswith("file://"):
+                path = loc.replace("file://", "")
+            else:
+                path = loc or ""
+
+            if not path:
+                continue
+
+            # Load + chunk
+            wave, sr = load_audio_16k(path)
+            chunks = chunk_audio(wave, sr, chunk)
+
+            for idx, chunk_wav in enumerate(chunks):
+                if len(chunk_wav) == 0:
+                    continue
+                start_s = idx * chunk
+                end_s = (idx + 1) * chunk
+
+                pred, topN = model.infer_chunk(chunk_wav, top=top)
+
+                # Create a TimeFrame
+                tf = new_view.new_annotation(AnnotationTypes.TimeFrame)
+                tf.add_property("start", int(start_s * 1000))
+                tf.add_property("end", int(end_s * 1000))
+                tf.add_property("label", pred)
+                tf.add_property("scores", [{"label": l, "score": float(s)} for l, s in topN])
+                tf.add_property("document", doc.id)
+
+        return mmif_obj.serialize(pretty=True)

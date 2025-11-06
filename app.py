@@ -1,141 +1,118 @@
-import argparse
-import logging
-import pathlib
-from typing import Dict, Generator, Tuple, List, Union
+#!/usr/bin/env python3
+"""
+CLAMS app for Spoken Language Identification using SpeechBrain VoxLingua107 (ECAPA).
 
-import librosa
+Mirrors the structure of Whisper-LID CLAMS app
+"""
+
+import os
+import numpy as np
 import torch
-import whisper
-from clams import ClamsApp, Restifier
-from mmif import Mmif, View, AnnotationTypes, DocumentTypes
-from whisper.tokenizer import LANGUAGES, get_tokenizer
-
-from lid_util import detect_language_by_chunk
-
-
-def load_audio_mono16(path: Union[str, pathlib.Path], sr: int = 16_000):
-    """Return waveform (mono, 16 kHz) and sample-rate."""
-    wav, _ = librosa.load(path, sr=sr, mono=True)
-    return wav, sr
+import librosa
+from clams.app import ClamsApp
+from mmif import Mmif, AnnotationTypes, DocumentTypes
+from speechbrain.inference.classifiers import EncoderClassifier
+import ffmpeg
 
 
-def chunk_audio(
-        wave, sr: int, window_sec: float = 30.0
-) -> Generator[Tuple[torch.Tensor, int, int], None, None]:
-    """
-    Yield (chunk, start_ms, end_ms).  
-    `whisper.pad_or_trim` will pad/trim to 30 s anyway, so we don’t overlap.
-    """
-    window = int(window_sec * sr)
-    for i in range(0, len(wave), window):
-        chunk = wave[i: i + window]
-        start_ms = int(1_000 * i / sr)
-        end_ms = int(1_000 * (i + len(chunk)) / sr)
-        yield chunk, start_ms, end_ms
+def load_audio_16k(path):
+    wave, sr = librosa.load(path, sr=16000, mono=True)
+    return wave, sr
 
 
-def _get_tokenizer_cached(cache: Dict[str, "whisper.tokenizer.Tokenizer"], key: str, model):
-    """Cache tokenizers per *model size* string (tiny, small, …)."""
-    if key not in cache:
-        try:
-            cache[key] = get_tokenizer(model.is_multilingual)
-        except TypeError:
-            cache[key] = get_tokenizer(multilingual=model.is_multilingual, task="lang_id")
-    return cache[key]
+def chunk_audio(wave, sr, chunk_sec=30.0):
+    window = int(chunk_sec * sr)
+    return [wave[i:i + window] for i in range(0, len(wave), window)]
 
 
-class SpokenLIDWrapper(ClamsApp):
-    """Whisper-based Spoken-Language-ID wrapped as a CLAMS app."""
+def _topk_from_logprobs(logprobs, k, ind2lab):
+    # top-k language predictions and their scores
+    probs = logprobs.exp()
+    k = min(k, probs.numel())
+    vals, idxs = torch.topk(probs, k)
+    return [(ind2lab[int(i)], float(v)) for i, v in zip(idxs, vals)]
 
+
+class VoxLinguaModel:
+    # SpeechBrain ECAPA-based VoxLingua107 model wrapper
+    def __init__(self, device="auto"):
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/lang-id-voxlingua107-ecapa",
+            savedir="voxlingua_cache",
+            run_opts={"device": self.device},
+        )
+        self.ind2lab = self.classifier.hparams.label_encoder.ind2lab
+
+    def infer_chunk(self, chunk_wav, top=3):
+        wav = torch.from_numpy(chunk_wav.astype(np.float32)).unsqueeze(0).to(self.device)
+        wav_lens = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+        logp, _, _, _ = self.classifier.classify_batch(wav, wav_lens)
+        logp = logp.squeeze(0)
+        topN = _topk_from_logprobs(logp, top, self.ind2lab)
+        pred = topN[0][0] if topN else ""
+        return pred, topN
+
+
+class VoxLinguaLID(ClamsApp):
+    # same interface as WhisperLID."""
     def __init__(self):
         super().__init__()
-        self._models: Dict[str, whisper.Whisper] = {}
-        self._tokenizers: Dict[str, "whisper.tokenizer.Tokenizer"] = {}
-        self.labelset: List[str] = list(LANGUAGES)
+        from metadata import appmetadata
+        self.__metadata = appmetadata()
 
     def _appmetadata(self):
-        from metadata import appmetadata
-        return appmetadata()
+        return self.__metadata
 
-    def _get_model(self, size: str):
-        if size not in self._models:
-            self.logger.debug(f"Loading Whisper model: {size}")
-            self._models[size] = whisper.load_model(size)
-        return self._models[size]
+    def _annotate(self, mmif, **params):
+        """Annotate audio documents with chunk-level language predictions."""
+        # normalize params like Whisper app
+        def _get_param(name, default, caster):
+            v = params.get(name, default)
+            if isinstance(v, list):
+                v = v[0] if v else default
+            return caster(v)
 
-    def _annotate(self, mmif_input: Union[str, dict, Mmif], **params) -> Mmif:
-        """
-        Attach TimeFrame annotations with ISO 639-3 language labels and a
-        `classification` dict of log-probabilities.
-        """
-        if isinstance(mmif_input, Mmif):
-            mmif = mmif_input
-        else:
-            mmif = Mmif(mmif_input)
+        chunk = _get_param("chunk", 30.0, float)
+        top = _get_param("top", 3, int)
+        device = _get_param("device", "auto", str)
 
-        model_size = params.get("model", "tiny")
-        window_sec = float(params.get("chunk", 30))
-        top_k = int(params.get("top", 3))
+        mmif_obj = Mmif(mmif) if not isinstance(mmif, Mmif) else mmif
+        new_view = mmif_obj.new_view()
+        self.sign_view(new_view, params)
+        new_view.new_contain(AnnotationTypes.TimeFrame, timeUnit="milliseconds")
 
-        model = self._get_model(model_size)
-        # tokenizer = _get_tokenizer_cached(self._tokenizers, model)
-        tokenizer = _get_tokenizer_cached(self._tokenizers, model_size, model)
+        model = VoxLinguaModel(device=device)
 
-        for doc in mmif.get_documents_by_type(DocumentTypes.AudioDocument):
-            audio_path = doc.location_path(nonexist_ok=False)
-            wave, sr = load_audio_mono16(audio_path)
+        for doc in mmif_obj.documents:
+            if doc.at_type != DocumentTypes.AudioDocument:
+                continue
+            loc = doc.location
+            path = loc.replace("file://", "") if loc and loc.startswith("file://") else loc
+            if not path or not os.path.exists(path):
+                continue
 
-            # create view
-            view: View = mmif.new_view()
-            self.sign_view(view, params)
+            wave, sr = load_audio_16k(path)
+            chunks = chunk_audio(wave, sr, chunk)
 
-            view.new_contain(
-                AnnotationTypes.TimeFrame,
-                document=doc.id,
-                timeUnit="milliseconds",
-                # labelset=self.labelset,
-            )
-
-            for chunk, start_ms, end_ms in chunk_audio(wave, sr, window_sec):
-                if len(chunk) == 0:
+            for idx, chunk_wav in enumerate(chunks):
+                if len(chunk_wav) == 0:
                     continue
+                start_s = idx * chunk
+                end_s = (idx + 1) * chunk
+                pred, topN = model.infer_chunk(chunk_wav, top=top)
 
-                mel = whisper.log_mel_spectrogram(
-                    whisper.pad_or_trim(torch.tensor(chunk, dtype=torch.float32).to(model.device)),
-                    n_mels=model.dims.n_mels,
-                ).unsqueeze(0)
-                probs_sorted, iso_code = detect_language_by_chunk(model, mel, tokenizer)
-                tf = view.new_annotation(AnnotationTypes.TimeFrame)
-                tf.add_property("start", start_ms)
-                tf.add_property("end", end_ms)
-                # strip LLM affixes if present, keeping alphanumerics only
-                iso_code = ''.join(c for c in iso_code if c.isalnum())
-                tf.add_property("label", iso_code)
-                tf.add_property("classification",
-                                dict(list(probs_sorted.items())[:top_k]))
+                tf = new_view.new_annotation(AnnotationTypes.TimeFrame)
+                tf.add_property("start", int(start_s * 1000))
+                tf.add_property("end", int(end_s * 1000))
+                tf.add_property("label", pred)
+                tf.add_property("scores", [{"label": l, "score": float(s)} for l, s in topN])
+                tf.add_property("document", doc.id)
 
         return mmif
 
 
 def get_app():
-    """Required by CLAMS runner/cli – returns a ready-to-use app."""
-    return SpokenLIDWrapper()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", action="store", default="5000", help="set port to listen")
-    parser.add_argument("--production", action="store_true", help="run gunicorn server")
-    parsed_args = parser.parse_args()
-
-    # create the app instance
-    app = get_app()
-
-    http_app = Restifier(app, port=int(parsed_args.port))
-    # for running the application in production mode
-    if parsed_args.production:
-        http_app.serve_production()
-    # development mode
-    else:
-        app.logger.setLevel(logging.DEBUG)
-        http_app.run()
+    return VoxLinguaLID()
