@@ -1,6 +1,7 @@
 import argparse
 import logging
 import pathlib
+from itertools import chain
 from typing import Dict, Generator, Tuple, List, Union
 
 import librosa
@@ -81,7 +82,8 @@ class SpokenLIDWrapper(ClamsApp):
         # tokenizer = _get_tokenizer_cached(self._tokenizers, model)
         tokenizer = _get_tokenizer_cached(self._tokenizers, model_size, model)
 
-        for doc in mmif.get_documents_by_type(DocumentTypes.AudioDocument):
+        for doc in chain(mmif.get_documents_by_type(DocumentTypes.AudioDocument),
+                         mmif.get_documents_by_type(DocumentTypes.VideoDocument)):
             audio_path = doc.location_path(nonexist_ok=False)
             wave, sr = load_audio_mono16(audio_path)
 
