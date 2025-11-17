@@ -1,0 +1,52 @@
+# Use CLAMS base image with PyTorch support
+FROM ghcr.io/clamsproject/clams-python-ffmpeg-torch2:1.3.3
+# See https://github.com/orgs/clamsproject/packages?tab=packages&q=clams-python for more base images
+
+################################################################################
+# DO NOT EDIT THIS SECTION
+ARG CLAMS_APP_VERSION
+ENV CLAMS_APP_VERSION ${CLAMS_APP_VERSION}
+################################################################################
+
+################################################################################
+# Force CPU mode for broader GPU compatibility
+# AmberNet requires CUDA 7.0+, but many systems have older GPUs
+# CPU mode ensures the app works everywhere
+ENV CUDA_VISIBLE_DEVICES=""
+
+# Cache directories for NeMo and PyTorch models
+ENV XDG_CACHE_HOME='/cache'
+ENV HF_HOME="/cache/huggingface"
+ENV TORCH_HOME="/cache/torch"
+
+RUN mkdir -p /cache && rm -rf /root/.cache && ln -s /cache /root/.cache
+################################################################################
+
+################################################################################
+# Install system dependencies if needed
+# RUN apt-get update && apt-get install -y \
+#     libsndfile1 \
+#     && rm -rf /var/lib/apt/lists/*
+################################################################################
+
+################################################################################
+# Main app installation
+COPY ./ /app
+WORKDIR /app
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements_ambernet.txt
+
+# Pre-download AmberNet model during build (optional but recommended)
+# This makes first run faster for end users
+RUN python3 -c "\
+import os; \
+os.environ['CUDA_VISIBLE_DEVICES'] = ''; \
+import nemo.collections.asr as nemo_asr; \
+print('Pre-downloading AmberNet model...'); \
+nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained('langid_ambernet'); \
+print('AmberNet model cached successfully')" || echo "Model pre-download failed, will download on first run"
+
+# Default command to run the CLAMS app in production server mode
+CMD ["python3", "app_ambernet.py", "--production"]
+################################################################################

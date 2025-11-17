@@ -1,0 +1,22 @@
+# CLAMS framework
+clams-python==1.3.3
+
+# NeMo toolkit for AmberNet
+nemo-toolkit[all]==1.23.0
+pytorch-lightning==2.1.0
+
+# PyTorch (compatible with NeMo 1.23)
+torch==2.0.1
+torchaudio==2.0.2
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# Configuration (used by NeMo)
+omegaconf==2.3.0
+hydra-core==1.3.2
+
+# Other dependencies
+numpy>=1.21.0,<2.0.0
+scipy>=1.7.0
