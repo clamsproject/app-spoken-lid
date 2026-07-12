@@ -1,105 +1,91 @@
 #!/usr/bin/env python3
 """
-Thin CLI interface for the Spoken-LID CLAMS app.
+The purpose of this file is to define a thin CLI interface for your app
 
-Keeps all argument definitions in one place (metadata.py) so you
-never have to update this file when you add or rename parameters.
-
-DO NOT RENAME this file – CLAMS tooling looks specifically for
-`cli.py` when generating container entrypoints.
+DO NOT CHANGE the name of the file
 """
 
 import argparse
 import sys
 from contextlib import redirect_stdout
 
-import app                        
+import app
+
+import clams.app
 from clams import AppMetadata
-import clams.app                 
 
 
 def metadata_to_argparser(app_metadata: AppMetadata) -> argparse.ArgumentParser:
-    """Generate ArgumentParser directly from metadata.py."""
+    """
+    Automatically generate an argparse.ArgumentParser from parameters specified in the app metadata (metadata.py).
+    """
+
     parser = argparse.ArgumentParser(
-        description=(
-            f"{app_metadata.name}: {app_metadata.description} "
-            f"(see {app_metadata.url} for details)"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+        description=f"{app_metadata.name}: {app_metadata.description} (visit {app_metadata.url} for more info)",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
-
-    for p in app_metadata.parameters:
-        kw = dict(help=p.description)
-        flag = f"--{p.name}"
-
-        if p.multivalued:
-            kw.update(nargs="+", action="extend", type=str)
+    # parse cli args from app parameters
+    for parameter in app_metadata.parameters:
+        if parameter.multivalued:
+            a = parser.add_argument(
+                f"--{parameter.name}",
+                help=parameter.description,
+                nargs='+',
+                action='extend',
+                type=str
+            )
         else:
-            kw.update(nargs=1, action="store", type=str)
-
-        arg = parser.add_argument(flag, **kw)
-
-        if p.choices:
-            arg.choices = p.choices
-        if p.default is not None:
-            default_help = f"(default: {p.default}"
-            if p.type == "boolean":
-                default_help += (
-                    f", any value except "
-                    f"{[v for v in clams.app.falsy_values if isinstance(v, str)]} "
-                    "interpreted as True"
-                )
-            arg.help += " " + default_help + ")"
-
-    
-    parser.add_argument(
-        "IN_MMIF_FILE",
-        nargs="?",
-        type=argparse.FileType("r"),
-        default=None if sys.stdin.isatty() else sys.stdin,
-        help=(
-            "Input MMIF path, or STDIN if ‘-’ or omitted. "
-            "When piping in containers, use `-i` to keep stdin open."
-        ),
-    )
-    parser.add_argument(
-        "OUT_MMIF_FILE",
-        nargs="?",
-        type=argparse.FileType("w"),
-        default=sys.stdout,
-        help=(
-            "Output MMIF path, or STDOUT if ‘-’ or omitted. "
-            "If STDOUT, any print() output from the app is redirected to stderr."
-        ),
-    )
+            a = parser.add_argument(
+                f"--{parameter.name}",
+                help=parameter.description,
+                nargs=1,
+                action="store",
+                type=str)
+        if parameter.choices is not None:
+            a.choices = parameter.choices
+        if parameter.default is not None:
+            a.help += f" (default: {parameter.default}"
+            if parameter.type == "boolean":
+                a.help += (f", any value except for {[v for v in clams.app.falsy_values if isinstance(v, str)]} "
+                           f"will be interpreted as True")
+            a.help += ')'
+            # then we don't have to add default values to the arg_parser
+            # since that's handled by the app._refined_params() method.
+    parser.add_argument('IN_MMIF_FILE', nargs='?', type=argparse.FileType('r'),
+                        help='input MMIF file path, or STDIN if `-` or not provided. NOTE: When running this cli.py in '
+                             'a containerized environment, make sure the container is run with `-i` flag to keep stdin '
+                             'open.',
+                        # will check if stdin is a keyboard, and return None if it is
+                        default=None if sys.stdin.isatty() else sys.stdin)
+    parser.add_argument('OUT_MMIF_FILE', nargs='?', type=argparse.FileType('w'),
+                        help='output MMIF file path, or STDOUT if `-` or not provided. NOTE: When this is set to '
+                             'STDOUT, any print statements in the app code will be redirected to stderr.',
+                        default=sys.stdout)
     return parser
 
 
-
 if __name__ == "__main__":
-    clamsapp = app.get_app()          
-    arg_parser = metadata_to_argparser(clamsapp.metadata)
+    clamsapp = app.get_app()
+    arg_parser = metadata_to_argparser(app_metadata=clamsapp.metadata)
     args = arg_parser.parse_args()
-
     if args.IN_MMIF_FILE:
-        in_mmif = args.IN_MMIF_FILE.read()
-
+        in_data = args.IN_MMIF_FILE.read()
+        # since flask webapp interface will pass parameters as "unflattened" dict to handle multivalued parameters
+        # (https://werkzeug.palletsprojects.com/en/latest/datastructures/#werkzeug.datastructures.MultiDict.to_dict)
+        # we need to convert arg_parsers results into a similar structure, which is the dict values are wrapped in lists
         params = {}
-        for name, value in vars(args).items():
-            if name in {"IN_MMIF_FILE", "OUT_MMIF_FILE"} or value is None:
+        for pname, pvalue in vars(args).items():
+            if pvalue is None or pname in ['IN_MMIF_FILE', 'OUT_MMIF_FILE']:
                 continue
-            elif isinstance(value, list):
-                params[name] = value  
+            elif isinstance(pvalue, list):
+                params[pname] = pvalue
             else:
-                params[name] = [value] 
-
-        if args.OUT_MMIF_FILE is sys.stdout:
+                params[pname] = [pvalue]
+        if args.OUT_MMIF_FILE.name == '<stdout>':
             with redirect_stdout(sys.stderr):
-                out_mmif = clamsapp.annotate(in_mmif, **params)
+                out_mmif = clamsapp.annotate(in_data, **params)
         else:
-            out_mmif = clamsapp.annotate(in_mmif, **params)
-
+            out_mmif = clamsapp.annotate(in_data, **params)
         args.OUT_MMIF_FILE.write(out_mmif)
     else:
         arg_parser.print_help()
